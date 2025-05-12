@@ -30,24 +30,82 @@ class WordPressAPIError extends Error {
   }
 }
 
+// Retry configuration
+const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY = 1000; // 1 second
+
+async function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function wordpressFetch<T>(url: string): Promise<T> {
   const userAgent = "Next.js WordPress Client";
+  let lastError: Error | null = null;
+  
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          "User-Agent": userAgent,
+        },
+        // Add a longer timeout for the request
+        signal: AbortSignal.timeout(30000), // 30 seconds timeout
+      });
 
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": userAgent,
-    },
-  });
+      if (!response.ok) {
+        // If we get a 404, don't retry
+        if (response.status === 404) {
+          throw new WordPressAPIError(
+            `WordPress API request failed: Resource not found`,
+            response.status,
+            url
+          );
+        }
 
-  if (!response.ok) {
-    throw new WordPressAPIError(
-      `WordPress API request failed: ${response.statusText}`,
-      response.status,
-      url
-    );
+        throw new WordPressAPIError(
+          `WordPress API request failed: ${response.statusText}`,
+          response.status,
+          url
+        );
+      }
+
+      const data = await response.json();
+      
+      // For endpoints that return arrays, check if the response is empty
+      if (Array.isArray(data) && data.length === 0) {
+        throw new WordPressAPIError(
+          `WordPress API request failed: No data found`,
+          404,
+          url
+        );
+      }
+
+      return data;
+    } catch (error) {
+      lastError = error as Error;
+      
+      // Don't retry on 404s
+      if (error instanceof WordPressAPIError && error.status === 404) {
+        throw error;
+      }
+
+      // If this was the last attempt, throw the error
+      if (attempt === MAX_RETRIES - 1) {
+        throw new WordPressAPIError(
+          `WordPress API request failed after ${MAX_RETRIES} attempts: ${lastError.message}`,
+          500,
+          url
+        );
+      }
+
+      // Exponential backoff
+      const delay = INITIAL_RETRY_DELAY * Math.pow(2, attempt);
+      await sleep(delay);
+    }
   }
 
-  return response.json();
+  // This should never be reached due to the throw in the last attempt
+  throw lastError;
 }
 
 export async function getAllPosts(filterParams?: {
